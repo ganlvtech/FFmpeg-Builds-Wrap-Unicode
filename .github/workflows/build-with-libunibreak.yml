@@ -1,0 +1,111 @@
+name: Build FFmpeg with libunibreak
+
+on:
+  workflow_dispatch:
+    inputs:
+      doRelease:
+        description: 'Publish new release'
+        type: boolean
+        default: false
+        required: false
+
+env:
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  build_ffmpeg:
+    name: Build ffmpeg
+    if: ${{ !cancelled() || success() }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux64]
+        variant: [gpl 8.0]
+    steps:
+      - name: Free Disk-Space
+        run: df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/lib/android && df -h
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Login to Docker
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Image Name
+        id: imagename
+        run: |
+          IMG="btbn/ffmpeg-builds/${{ matrix.target }}-${{ matrix.variant }}"
+          IMG="${IMG/ /-}"
+          echo "name=ghcr.io/${IMG}" >> $GITHUB_OUTPUT
+          echo "rawname=${IMG#*/}" >> $GITHUB_OUTPUT
+      - name: Hack Target Image
+        run: |
+          T="$(echo -n ${{ github.token }} | sha256sum | head -c 64)" && echo -e "::add-mask::${T}\n::stop-commands::${T}"
+          IMG="${{ steps.imagename.outputs.name }}"
+          CONTAINER_NAME=ffmpeg-image-hack
+          docker pull "$IMG"
+          docker run -i --name "$CONTAINER_NAME" -v "$(pwd)":/FFmpeg-Builds "$IMG" /FFmpeg-Builds/hack-target-image.sh
+          docker stop "$CONTAINER_NAME"
+          docker commit "$CONTAINER_NAME" "$IMG"
+          docker rm -f "$CONTAINER_NAME"
+      - name: Build ffmpeg
+        run: |
+          T="$(echo -n ${{ github.token }} | sha256sum | head -c 64)" && echo -e "::add-mask::${T}\n::stop-commands::${T}"
+          GITHUB_REPOSITORY='' ./build.sh ${{ matrix.target }} ${{ matrix.variant }}
+      - name: Replace spaces in string
+        id: strs
+        run: |
+          SLUG="${{ matrix.target }}-${{ matrix.variant }}"
+          echo "artifact_slug=${SLUG// /-}" >> $GITHUB_OUTPUT
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ steps.strs.outputs.artifact_slug }}
+          overwrite: true
+          path: artifacts/*
+  publish_release:
+    name: Publish release
+    if: ${{ !cancelled() && github.event.inputs.doRelease == 'true' && needs.build_ffmpeg.result == 'success' }}
+    needs: build_ffmpeg
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk-Space
+        run: df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/lib/android && df -h
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ffmpeg-*
+          merge-multiple: true
+          path: artifacts
+      - name: Create release
+        id: create_release
+        run: |
+          set -xe
+          shopt -s nullglob
+          RELDATE="$(date +'%Y-%m-%d %H:%M')"
+          NAME="Auto-Build $RELDATE"
+          TAGNAME="autobuild-$(date +'%Y-%m-%d-%H-%M')"
+          (cd artifacts && sha256sum *.{zip,tar.xz} > checksums.sha256)
+          gh release create "$TAGNAME" --target "master" --title "$NAME" artifacts/*.{zip,tar.xz} artifacts/checksums.*
+          echo "tag_name=${TAGNAME}" >> $GITHUB_OUTPUT
+          echo "rel_date=${RELDATE}" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Update Latest
+        run: |
+          set -xe
+          shopt -s nullglob
+          mkdir latest_artifacts
+          ./util/repack_latest.sh latest_artifacts artifacts/*.{zip,tar.xz}
+          (cd latest_artifacts && sha256sum *.{zip,tar.xz} > checksums.sha256)
+          NAME="Latest Auto-Build (${{ steps.create_release.outputs.rel_date }})"
+          TAGNAME="latest"
+          gh release delete --cleanup-tag --yes "$TAGNAME" || true
+          sleep 15
+          gh release create "$TAGNAME" --target "master" --title "$NAME" latest_artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
